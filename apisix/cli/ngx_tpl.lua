@@ -75,6 +75,10 @@ lua {
     {% end %}
 }
 
+{% if google_perftools_profiles and google_perftools_profiles.path then %}
+google_perftools_profiles {* google_perftools_profiles.path *};
+{% end %}
+
 {% if enabled_stream_plugins["prometheus"] and not enable_http then %}
 http {
     lua_package_path  "{*extra_lua_path*}$prefix/deps/share/lua/5.1/?.lua;$prefix/deps/share/lua/5.1/?/init.lua;]=]
