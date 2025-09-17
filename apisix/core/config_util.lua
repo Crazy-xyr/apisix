@@ -20,6 +20,7 @@
 -- @module core.config_util
 
 local core_tab = require("apisix.core.table")
+local json       = require("apisix.core.json")
 local log = require("apisix.core.log")
 local str_byte = string.byte
 local str_char = string.char
@@ -61,6 +62,7 @@ function _M.add_clean_handler(item, func)
     if not item.clean_handlers then
         return nil, "clean handlers for the item are nil"
     end
+    log.error("parse route which contain domain: ",json.delay_encode(item, true))
 
     if not item.clean_handlers._id then
         item.clean_handlers._id = 1
