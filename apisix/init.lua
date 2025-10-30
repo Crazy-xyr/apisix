@@ -46,6 +46,7 @@ local ctxdump         = require("resty.ctxdump")
 local debug           = require("apisix.debug")
 local pubsub_kafka    = require("apisix.pubsub.kafka")
 local resource        = require("apisix.resource")
+local trusted_addresses_util = require("apisix.utils.trusted-addresses")
 local ngx             = ngx
 local get_method      = ngx.req.get_method
 local ngx_exit        = ngx.exit
@@ -59,7 +60,8 @@ local str_sub         = string.sub
 local tonumber        = tonumber
 local type            = type
 local pairs           = pairs
-local tostring       = tostring
+local tostring        = tostring
+local pcall           = pcall
 local ngx_re_match    = ngx.re.match
 local control_api_router
 
@@ -162,6 +164,8 @@ function _M.http_init_worker()
     -- To ensure that all workers related to Prometheus metrics are initialized,
     -- we need to put the initialization of the Prometheus plugin here.
     plugin.init_prometheus()
+
+    trusted_addresses_util.init_worker()
 end
 
 
@@ -263,8 +267,12 @@ local function parse_domain_in_route(route)
     route.value.upstream.nodes = new_nodes
     resource.set_nodes_ver_and_nodes(route.value.upstream.resource_key,
                                                     nodes_ver, new_nodes)
+    -- remove plugin before logging to avoid logging sensitive info
+    local route_log = core.table.deepcopy(route)
+    route_log.value.plugins = nil
+    route_log.value.auth_conf = nil
     core.log.info("parse route which contain domain: ",
-                  core.json.delay_encode(route, true))
+                core.json.delay_encode(route_log, true))
     return route
 end
 
@@ -292,21 +300,6 @@ end
 
 local function set_upstream_headers(api_ctx, picked_server)
     set_upstream_host(api_ctx, picked_server)
-
-    local proto = api_ctx.var.http_x_forwarded_proto
-    if proto then
-        api_ctx.var.var_x_forwarded_proto = proto
-    end
-
-    local x_forwarded_host = api_ctx.var.http_x_forwarded_host
-    if x_forwarded_host then
-        api_ctx.var.var_x_forwarded_host = x_forwarded_host
-    end
-
-    local port = api_ctx.var.http_x_forwarded_port
-    if port then
-        api_ctx.var.var_x_forwarded_port = port
-    end
 end
 
 
@@ -599,6 +592,79 @@ function _M.handle_upstream(api_ctx, route, enable_websocket)
 end
 
 
+local function handle_x_forwarded_headers(api_ctx)
+    local addr_is_trusted = trusted_addresses_util.is_trusted(api_ctx.var.realip_remote_addr)
+
+    -- Only untrusted values need to be overwritten or cleared.
+    if not addr_is_trusted then
+        -- store the original x-forwarded-* headers
+        -- to allow future use by other plugins or processes
+        api_ctx.var.original_x_forwarded_proto = api_ctx.var.http_x_forwarded_proto
+        api_ctx.var.original_x_forwarded_host = api_ctx.var.http_x_forwarded_host
+        api_ctx.var.original_x_forwarded_port = api_ctx.var.http_x_forwarded_port
+        api_ctx.var.original_x_forwarded_for = api_ctx.var.http_x_forwarded_for
+
+        -- trusted ones
+        -- ref: ngx_tpl.lua#L831-L840
+        --
+        -- these values are observed directly by APISIX and cannot be forged,
+        -- making them highly credible.
+        local proto = api_ctx.var.scheme
+        local host = api_ctx.var.host
+        local port = api_ctx.var.server_port
+
+        -- override the x-forwarded-* headers to the trusted ones.
+        -- make sure that the correct values ​​are obtained
+        -- in the subsequent stages using `core.request.header`.
+        core.request.set_header(api_ctx, "X-Forwarded-Proto", proto)
+        core.request.set_header(api_ctx, "X-Forwarded-Host", host)
+        core.request.set_header(api_ctx, "X-Forwarded-Port", port)
+        -- later processed in ngx_tpl by `$proxy_add_x_forwarded_for`.
+        core.request.set_header(api_ctx, "X-Forwarded-For", nil)
+
+        -- update the cached value in http_x_forwarded_* to the trusted ones.
+        -- make sure that the correct values ​​are obtained
+        -- in the subsequent stages using `var.http_x_forwarded_*`.
+        api_ctx.var.http_x_forwarded_proto = proto
+        api_ctx.var.http_x_forwarded_host = host
+        api_ctx.var.http_x_forwarded_port = port
+        api_ctx.var.http_x_forwarded_for = nil
+    end
+end
+
+
+-- in ngx_tpl.lua#L831-L840,
+-- there is such code: `proxy_set_header X-Forwarded-XXX $var_x_forwarded_xxx;`
+-- that is, set the `X-Forwarded-XXX` header through `var_x_forwarded_xxx`.
+--
+-- therefore, it is necessary to set the trusted `http_x_forwarded_xxx` to `var_x_forwarded_xxx`.
+-- So that the `X-Forwarded-XXX` header is updated to a trusted value.
+--
+-- currently, only following headers are updated through these variables:
+-- - X-Forwarded-Proto
+-- - X-Forwarded-Port
+-- - X-Forwarded-Host
+--
+-- the `X-Forwarded-For` header is not updated through these variables.
+-- because it is set by the `proxy_add_x_forwarded_for` directive.
+local function set_upstream_x_forwarded_headers(api_ctx)
+    local proto = api_ctx.var.http_x_forwarded_proto
+    if proto then
+        api_ctx.var.var_x_forwarded_proto = proto
+    end
+
+    local port = api_ctx.var.http_x_forwarded_port
+    if port then
+        api_ctx.var.var_x_forwarded_port = port
+    end
+
+    local host = api_ctx.var.http_x_forwarded_host
+    if host then
+        api_ctx.var.var_x_forwarded_host = host
+    end
+end
+
+
 function _M.http_access_phase()
     -- from HTTP/3 to HTTP/1.1 we need to convert :authority pesudo-header
     -- to Host header, so we set upstream_host variable here.
@@ -647,6 +713,8 @@ function _M.http_access_phase()
     -- the original request_uri can be accessed via var.real_request_uri
     api_ctx.var.real_request_uri = api_ctx.var.request_uri
     api_ctx.var.request_uri = api_ctx.var.uri .. api_ctx.var.is_args .. (api_ctx.var.args or "")
+
+    handle_x_forwarded_headers(api_ctx)
 
     router.router_http.match(api_ctx)
 
@@ -754,6 +822,8 @@ function _M.http_access_phase()
     end
 
     _M.handle_upstream(api_ctx, route, enable_websocket)
+
+    set_upstream_x_forwarded_headers(api_ctx)
 end
 
 
@@ -1107,6 +1177,9 @@ function _M.stream_init_worker()
     apisix_upstream.init_worker()
 
     require("apisix.events").init_worker()
+
+    -- for admin api of standalone mode, we need to startup background timer and patch schema etc.
+    require("apisix.admin.init").init_worker()
 
     local discovery = require("apisix.discovery.init").discovery
     if discovery and discovery.init_worker then

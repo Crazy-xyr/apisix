@@ -31,8 +31,7 @@ apisix:
     data_encryption:
         enable_encrypt_fields: true
         keyring:
-        - qeddd145sfvddff3
-        - edd1c9f0985e76a2
+        - abcdef1234567890
 _EOC_
 
     $block->set_value("extra_yaml_config", $extra_yaml_config);
