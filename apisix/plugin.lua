@@ -935,18 +935,15 @@ end
 
 local enable_data_encryption
 local function enable_gde()
-    if enable_data_encryption ~= nil then
-        return enable_data_encryption
-    end
-
-    enable_data_encryption =
+    if enable_data_encryption == nil then
+        enable_data_encryption =
             core.table.try_read_attr(local_conf, "apisix", "data_encryption",
                     "enable_encrypt_fields") and (core.config.type == "etcd")
-    _M.enable_data_encryption = enable_data_encryption
+        _M.enable_data_encryption = enable_data_encryption
+    end
 
     return enable_data_encryption
 end
-_M.enable_gde = enable_gde
 
 
 local function get_plugin_schema_for_gde(name, schema_type)
